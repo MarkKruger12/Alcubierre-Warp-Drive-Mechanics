@@ -1,3 +1,4 @@
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 # Alcubierre-Warp-Drive-Mechanics (PoC)
 
 **Proof of Concept:** A comprehensive computational and analytical framework for the Alcubierre warp metric, rooted in General Relativity and advanced field theory.
