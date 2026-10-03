@@ -45,7 +45,7 @@ def coupling(c1, c2, d):
     return mutual_inductance(c1, c2, d) / np.sqrt(c1.inductance * c2.inductance)
 
 
-def solve_link(c1, c2, d, f, f0, rl, rs=0.0, c1_tune=None, c2_tune=None):
+def solve_link(c1, c2, d, f, f0, rl, rs=0.0, c1_tune=None, c2_tune=None, k_scale=1.0):
     """Solve the series-series link at frequency f (Hz). Returns dict of efficiencies and currents.
 
     Capacitors are tuned to resonate each coil at f0 unless overridden. Source amplitude is 1 V peak.
@@ -56,7 +56,7 @@ def solve_link(c1, c2, d, f, f0, rl, rs=0.0, c1_tune=None, c2_tune=None):
     R1, R2 = w0 * L1 / c1.q, w0 * L2 / c2.q
     C1 = c1_tune if c1_tune else 1 / (w0**2 * L1)
     C2 = c2_tune if c2_tune else 1 / (w0**2 * L2)
-    M = mutual_inductance(c1, c2, d)
+    M = k_scale * mutual_inductance(c1, c2, d)   # k_scale absorbs geometry errors (fit parameter)
 
     Z1 = rs + R1 + 1j * w * L1 + 1 / (1j * w * C1)
     Z2 = R2 + rl + 1j * w * L2 + 1 / (1j * w * C2)
