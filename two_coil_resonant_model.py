@@ -87,30 +87,62 @@ def optimal_load(c1, c2, d, f0):
     return R2 * np.sqrt(1 + (w0 * M) ** 2 / (R1 * R2))
 
 
-def solve_n_coil(coils, z, f, f0, tuned, r_extra):
-    """General N coaxial-coil network at a single frequency f (Hz); every pair is coupled.
+def mutual_matrix(coils, z):
+    """Symmetric matrix of mutual inductances (H) between coaxial coils at axial positions z."""
+    n = len(coils)
+    M = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            M[i, j] = M[j, i] = float(mutual_inductance(coils[i], coils[j], abs(z[i] - z[j])))
+    return M
+
+
+def solve_n_coil(coils, z, f, f0, tuned, r_extra, M=None):
+    """General N coaxial-coil network; every pair is coupled. f may be a scalar or an array (Hz).
 
     coils: list of Coil; z: axial positions (m); tuned: per-coil bool (series cap resonant at f0);
     r_extra: per-coil extra series resistance (source Rs on coil 0, load RL on the last coil).
     Source (1 V peak) drives coil 0; the load resistor is in series with the last coil.
+    M: optional precomputed mutual_matrix (speeds up frequency/gap searches).
     """
-    w, w0 = 2 * np.pi * f, 2 * np.pi * f0
+    scalar = np.ndim(f) == 0
+    w = 2 * np.pi * np.atleast_1d(np.asarray(f, dtype=float))
+    w0 = 2 * np.pi * f0
     n = len(coils)
-    Z = np.zeros((n, n), dtype=complex)
+    M = mutual_matrix(coils, z) if M is None else M
+    Z = np.zeros((len(w), n, n), dtype=complex)
     for i, c in enumerate(coils):
         L = c.inductance
-        Z[i, i] = w0 * L / c.q + r_extra[i] + 1j * w * L
+        Z[:, i, i] = w0 * L / c.q + r_extra[i] + 1j * w * L
         if tuned[i]:
-            Z[i, i] += 1 / (1j * w * (1 / (w0**2 * L)))
-        for j in range(i + 1, n):
-            Z[i, j] = Z[j, i] = 1j * w * float(mutual_inductance(c, coils[j], abs(z[i] - z[j])))
-    v = np.zeros(n, dtype=complex)
-    v[0] = 1.0
-    i_vec = np.linalg.solve(Z, v)
-    p_src = 0.5 * np.real(i_vec[0])
-    p_load = 0.5 * r_extra[-1] * abs(i_vec[-1]) ** 2
-    p_in = p_src - 0.5 * r_extra[0] * abs(i_vec[0]) ** 2   # power entering the coil network
-    return {"eta_total": p_load / p_src, "eta_link": p_load / p_in, "i": i_vec}
+            Z[:, i, i] += 1 / (1j * w * (1 / (w0**2 * L)))
+        for j in range(n):
+            if j != i:
+                Z[:, i, j] = 1j * w * M[i, j]
+    v = np.zeros((len(w), n, 1), dtype=complex)
+    v[:, 0, 0] = 1.0
+    i_vec = np.linalg.solve(Z, v)[:, :, 0]
+    p_src = 0.5 * np.real(i_vec[:, 0])
+    p_load = 0.5 * r_extra[-1] * np.abs(i_vec[:, -1]) ** 2
+    p_in = p_src - 0.5 * r_extra[0] * np.abs(i_vec[:, 0]) ** 2   # power entering the coil network
+    out = {"eta_total": p_load / p_src, "eta_link": p_load / p_in, "i": i_vec}
+    return {k: (v_[0] if scalar else v_) for k, v_ in out.items()}
+
+
+def best_frequency(coils, z, f0, tuned, r_extra, key="eta_total", span=0.2, n=801):
+    """Retune the drive frequency (capacitors stay fixed at the f0 design) to maximise `key`.
+
+    Strong coupling splits and shifts the resonance, so the best drive frequency is not f0.
+    Returns (f_best, result_at_f_best). Two-pass: coarse sweep, then a fine sweep around the peak.
+    """
+    M = mutual_matrix(coils, z)
+    fs = f0 * np.linspace(1 - span, 1 + span, n)
+    k = int(np.argmax(solve_n_coil(coils, z, fs, f0, tuned, r_extra, M)[key]))
+    step = fs[1] - fs[0]
+    fs = np.linspace(fs[k] - step, fs[k] + step, 201)
+    res = solve_n_coil(coils, z, fs, f0, tuned, r_extra, M)
+    k = int(np.argmax(res[key]))
+    return fs[k], {kk: vv[k] for kk, vv in res.items()}
 
 
 def four_coil(res, loop, d, g_tx, g_rx, f, f0, rs, rl):
@@ -125,6 +157,19 @@ def best_loop_gap(res, loop, d, f0, rs, rl, gaps=None):
     eta = [four_coil(res, loop, d, g, g, f0, f0, rs, rl)["eta_link"] for g in gaps]
     k = int(np.argmax(eta))
     return gaps[k], eta[k]
+
+
+def best_loop_gap_retuned(res, loop, d, f0, rs, rl, key="eta_total", gaps=None):
+    """Joint search: loop gap AND drive frequency that maximise `key`. Returns (gap, f, result)."""
+    gaps = np.geomspace(0.005, 0.4, 40) if gaps is None else gaps
+    best = None
+    for g in gaps:
+        z = [0.0, g, g + d, g + d + g]
+        f, r = best_frequency([loop, res, res, loop], z, f0, [False, True, True, False],
+                              [rs, 0, 0, rl], key=key, span=0.2, n=201)
+        if best is None or r[key] > best[2][key]:
+            best = (g, f, r)
+    return best
 
 
 def self_check():
@@ -153,6 +198,10 @@ def self_check():
     for d in (0.3, 0.6):
         _, eta4 = best_loop_gap(res, loop, d, f0, 50.0, 50.0)
         assert eta4 <= float(eta_max_theory(coupling(res, res, d), res.q, res.q)) + 1e-9
+    # Retuning the drive frequency can only help (f0 is inside the search range)
+    f_b, r_b = best_frequency([c, c], [0.0, 0.1], f0, [True, True], [5.0, 20.0])
+    r_0 = solve_n_coil([c, c], [0.0, 0.1], f0, f0, [True, True], [5.0, 20.0])
+    assert r_b["eta_total"] >= r_0["eta_total"] - 1e-12
     print("self-checks passed")
 
 
@@ -182,6 +231,21 @@ def main(plot=True):
         bound = float(eta_max_theory(coupling(coil, coil, d), coil.q, coil.q))
         print(f"{d:6.2f} {d/(2*coil.radius):5.1f} {float(r2['eta_link']):8.3f} {e4:8.3f} "
               f"{float(r2['eta_total']):9.3f} {t4:9.3f} {g:8.3f} {bound:7.3f}")
+
+    # --- Frequency retune: drive frequency (and loop gap) re-optimised per distance ---
+    print("\nWith drive-frequency retune (capacitors fixed at the f0 design): total efficiency")
+    print(f"{'d (m)':>6} {'d/D':>5} {'2c fixed':>9} {'2c retune':>10} {'f2 (MHz)':>9} "
+          f"{'4c fixed':>9} {'4c retune':>10} {'f4 (MHz)':>9} {'gap (m)':>8}")
+    retune = []
+    for d in four_d:
+        r2 = solve_link(coil, coil, d, f0, f0, rl, rs=rs)["eta_total"]
+        f2, rr2 = best_frequency([coil, coil], [0.0, d], f0, [True, True], [rs, rl])
+        g, e4 = best_loop_gap(coil, loop, d, f0, rs, rl)
+        t4 = four_coil(coil, loop, d, g, g, f0, f0, rs, rl)["eta_total"]
+        g4, f4, rr4 = best_loop_gap_retuned(coil, loop, d, f0, rs, rl)
+        retune.append((d, float(r2), rr2["eta_total"], t4, rr4["eta_total"], g4, f4))
+        print(f"{d:6.2f} {d/(2*coil.radius):5.1f} {float(r2):9.3f} {rr2['eta_total']:10.3f} {f2/1e6:9.4f} "
+              f"{t4:9.3f} {rr4['eta_total']:10.3f} {f4/1e6:9.4f} {g4:8.3f}")
 
     if not plot:
         return
@@ -242,6 +306,27 @@ def main(plot=True):
     fig2.tight_layout()
     fig2.savefig("four_coil_resonant_model.png", dpi=130)
     print("wrote four_coil_resonant_model.png")
+
+    # Retune figure
+    rt = np.array(retune)
+    fig3, cx = plt.subplots(1, 2, figsize=(11, 4.5))
+    xd = rt[:, 0] / (2 * coil.radius)
+    cx[0].plot(xd, rt[:, 1], "o--", label="2-coil, fixed f")
+    cx[0].plot(xd, rt[:, 2], "o-", label="2-coil, retuned f")
+    cx[0].plot(xd, rt[:, 3], "s--", label="4-coil, gap tuned, fixed f")
+    cx[0].plot(xd, rt[:, 4], "s-", label="4-coil, gap + f retuned")
+    cx[0].set(xlabel="resonator separation / diameter", ylabel="total efficiency (50 ohm source/load)",
+              title="Frequency retune")
+    cx[0].grid(alpha=.3)
+    cx[0].legend(fontsize=8)
+    cx[1].plot(xd, rt[:, 6] / 1e6, "s-")
+    cx[1].axhline(f0 / 1e6, color="k", ls=":")
+    cx[1].set(xlabel="resonator separation / diameter", ylabel="best drive frequency (MHz)",
+              title="4-coil best drive frequency (dotted = f0)")
+    cx[1].grid(alpha=.3)
+    fig3.tight_layout()
+    fig3.savefig("retune_resonant_model.png", dpi=130)
+    print("wrote retune_resonant_model.png")
 
 
 if __name__ == "__main__":
