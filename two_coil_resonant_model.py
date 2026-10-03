@@ -97,13 +97,14 @@ def mutual_matrix(coils, z):
     return M
 
 
-def solve_n_coil(coils, z, f, f0, tuned, r_extra, M=None):
+def solve_n_coil(coils, z, f, f0, tuned, r_extra, M=None, c_scale=None):
     """General N coaxial-coil network; every pair is coupled. f may be a scalar or an array (Hz).
 
     coils: list of Coil; z: axial positions (m); tuned: per-coil bool (series cap resonant at f0);
     r_extra: per-coil extra series resistance (source Rs on coil 0, load RL on the last coil).
     Source (1 V peak) drives coil 0; the load resistor is in series with the last coil.
     M: optional precomputed mutual_matrix (speeds up frequency/gap searches).
+    c_scale: optional per-coil capacitor trim; C_i = c_scale[i] * C_nominal(f0). Default 1 (no trim).
     """
     scalar = np.ndim(f) == 0
     w = 2 * np.pi * np.atleast_1d(np.asarray(f, dtype=float))
@@ -115,7 +116,8 @@ def solve_n_coil(coils, z, f, f0, tuned, r_extra, M=None):
         L = c.inductance
         Z[:, i, i] = w0 * L / c.q + r_extra[i] + 1j * w * L
         if tuned[i]:
-            Z[:, i, i] += 1 / (1j * w * (1 / (w0**2 * L)))
+            c_trim = 1.0 if c_scale is None else c_scale[i]
+            Z[:, i, i] += 1 / (1j * w * (c_trim / (w0**2 * L)))
         for j in range(n):
             if j != i:
                 Z[:, i, j] = 1j * w * M[i, j]
@@ -157,6 +159,44 @@ def best_loop_gap(res, loop, d, f0, rs, rl, gaps=None):
     eta = [four_coil(res, loop, d, g, g, f0, f0, rs, rl)["eta_link"] for g in gaps]
     k = int(np.argmax(eta))
     return gaps[k], eta[k]
+
+
+def best_caps(coils, z, f0, tuned, r_extra, key="eta_total", span=0.2, M=None):
+    """Trim each tuned coil's capacitor (drive frequency stays at f0) to maximise `key`.
+
+    Coarse grid over +-span of the nominal C on the two tuned coils, then Nelder-Mead polish.
+    Returns (c_scale list, result). Detuning from strong loop coupling is absorbed here.
+    """
+    from scipy.optimize import minimize
+    M = mutual_matrix(coils, z) if M is None else M
+    idx = [i for i, t in enumerate(tuned) if t]
+
+    def scales(x):
+        sc = np.ones(len(coils))
+        sc[idx] = x
+        return sc
+
+    def run(x):
+        return solve_n_coil(coils, z, f0, f0, tuned, r_extra, M, scales(x))
+
+    grid = np.linspace(1 - span, 1 + span, 17)
+    best = max(((a, b) for a in grid for b in grid), key=lambda x: run(np.array(x))[key])
+    opt = minimize(lambda x: -run(x)[key], np.array(best), method="Nelder-Mead",
+                   options={"xatol": 1e-5, "fatol": 1e-9})
+    x = opt.x if -opt.fun >= run(np.array(best))[key] else np.array(best)
+    return scales(x), run(x)
+
+
+def best_loop_gap_trimmed(res, loop, d, f0, rs, rl, key="eta_total", gaps=None):
+    """Joint search: loop gap and capacitor trim (drive frequency fixed at f0). -> (gap, c_scale, result)."""
+    gaps = np.geomspace(0.005, 0.4, 25) if gaps is None else gaps
+    best = None
+    for g in gaps:
+        z = [0.0, g, g + d, g + d + g]
+        sc, r = best_caps([loop, res, res, loop], z, f0, [False, True, True, False], [rs, 0, 0, rl], key)
+        if best is None or r[key] > best[2][key]:
+            best = (g, sc, r)
+    return best
 
 
 def best_loop_gap_retuned(res, loop, d, f0, rs, rl, key="eta_total", gaps=None):
@@ -202,6 +242,9 @@ def self_check():
     f_b, r_b = best_frequency([c, c], [0.0, 0.1], f0, [True, True], [5.0, 20.0])
     r_0 = solve_n_coil([c, c], [0.0, 0.1], f0, f0, [True, True], [5.0, 20.0])
     assert r_b["eta_total"] >= r_0["eta_total"] - 1e-12
+    # Capacitor trim (f fixed at f0) can only help: nominal C is inside the search range
+    sc, r_t = best_caps([c, c], [0.0, 0.1], f0, [True, True], [5.0, 20.0])
+    assert r_t["eta_total"] >= r_0["eta_total"] - 1e-12
     print("self-checks passed")
 
 
@@ -246,6 +289,18 @@ def main(plot=True):
         retune.append((d, float(r2), rr2["eta_total"], t4, rr4["eta_total"], g4, f4))
         print(f"{d:6.2f} {d/(2*coil.radius):5.1f} {float(r2):9.3f} {rr2['eta_total']:10.3f} {f2/1e6:9.4f} "
               f"{t4:9.3f} {rr4['eta_total']:10.3f} {f4/1e6:9.4f} {g4:8.3f}")
+
+    # --- Capacitor trim: generator stays at f0, resonator capacitors adjusted instead ---
+    print("\nWith capacitor trim (generator fixed at f0): total efficiency")
+    print(f"{'d (m)':>6} {'d/D':>5} {'2c fixed':>9} {'2c trim':>8} {'4c fixed':>9} {'4c f-retune':>12} "
+          f"{'4c C-trim':>10} {'C_tx/C0':>8} {'C_rx/C0':>8} {'gap (m)':>8}")
+    trim = []
+    for d, row in zip(four_d, retune):
+        sc2, rr2 = best_caps([coil, coil], [0.0, d], f0, [True, True], [rs, rl])
+        g, sc4, rr4 = best_loop_gap_trimmed(coil, loop, d, f0, rs, rl)
+        trim.append((d, row[1], rr2["eta_total"], row[3], row[4], rr4["eta_total"], g, sc4[1], sc4[2]))
+        print(f"{d:6.2f} {d/(2*coil.radius):5.1f} {row[1]:9.3f} {rr2['eta_total']:8.3f} {row[3]:9.3f} "
+              f"{row[4]:12.3f} {rr4['eta_total']:10.3f} {sc4[1]:8.3f} {sc4[2]:8.3f} {g:8.3f}")
 
     if not plot:
         return
@@ -327,6 +382,30 @@ def main(plot=True):
     fig3.tight_layout()
     fig3.savefig("retune_resonant_model.png", dpi=130)
     print("wrote retune_resonant_model.png")
+
+    # Capacitor-trim figure
+    tm = np.array(trim)
+    fig4, dx = plt.subplots(1, 2, figsize=(11, 4.5))
+    xt = tm[:, 0] / (2 * coil.radius)
+    dx[0].plot(xt, tm[:, 1], "o--", label="2-coil, no retune")
+    dx[0].plot(xt, tm[:, 2], "o-", label="2-coil, C trim")
+    dx[0].plot(xt, tm[:, 3], "s--", label="4-coil, gap tuned only")
+    dx[0].plot(xt, tm[:, 4], "s-.", label="4-coil, + drive-f retune")
+    dx[0].plot(xt, tm[:, 5], "s-", label="4-coil, + capacitor trim")
+    dx[0].set(xlabel="resonator separation / diameter", ylabel="total efficiency (50 ohm source/load)",
+              title="Capacitor trim (generator fixed at f0)")
+    dx[0].grid(alpha=.3)
+    dx[0].legend(fontsize=8)
+    dx[1].plot(xt, tm[:, 7], "s-", label="C_tx / C_nominal")
+    dx[1].plot(xt, tm[:, 8], "o-", label="C_rx / C_nominal")
+    dx[1].axhline(1, color="k", ls=":")
+    dx[1].set(xlabel="resonator separation / diameter", ylabel="capacitor trim factor",
+              title="Optimal capacitor values (4-coil)")
+    dx[1].grid(alpha=.3)
+    dx[1].legend(fontsize=8)
+    fig4.tight_layout()
+    fig4.savefig("captrim_resonant_model.png", dpi=130)
+    print("wrote captrim_resonant_model.png")
 
 
 if __name__ == "__main__":
